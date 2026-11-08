@@ -171,8 +171,8 @@ unauthenticated.
 |---|---|
 | `GET /v1/models` | The tier names, synthesized. Chat UIs build their model list from this, so it advertises tiers, not backend model names. |
 | `POST /v1/*` | Any request with a `"model"` field is routed and rewritten. |
-| `GET /_tiers` | What the router believes right now. Credentials are never echoed. |
-| `GET /healthz` | `ok` |
+| `GET /_tiers` | What the router believes right now: each tier's backend address and model. Requires an API key, because it reveals exactly what the tier names hide. Credentials are never echoed. |
+| `GET /healthz` | `ok`. The only route that needs no key, so health checks and process supervisors can use it. |
 
 ## Audit log
 

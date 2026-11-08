@@ -783,9 +783,20 @@ func main() {
 		fmt.Fprintln(w, "ok")
 	})
 
-	// What the router believes right now. Credentials are never echoed.
+	// What the router believes right now. Credentials are never echoed, but
+	// the reply names every backend's address and real model -- exactly what
+	// the tier abstraction keeps from clients -- so it sits behind the same
+	// front door as every routed request, and is audited like one.
 	mux.HandleFunc("/_tiers", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		cfg := current.Load()
+		rec := record(cfg, r)
+		if !authorized(cfg, r) {
+			writeErr(w, http.StatusUnauthorized, "invalid or missing API key")
+			finish(rec, start, http.StatusUnauthorized, "denied")
+			return
+		}
+		defer finish(rec, start, http.StatusOK, "ok")
 		out := map[string]any{}
 		for n, t := range cfg.Tiers {
 			out[n] = map[string]string{"base_url": t.BaseURL, "model": t.Model}
