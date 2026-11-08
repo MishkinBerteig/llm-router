@@ -1,0 +1,20 @@
+{
+  "listen": "0.0.0.0:12345",
+  "dial_timeout_ms": 2000,
+  "response_header_timeout_ms": 3600000,
+  "client_api_keys": ["REPLACE-WITH-A-LONG-RANDOM-KEY"],
+  "tiers": {
+    "amazing": { "base_url": "http://127.0.0.1:8201/v1", "model": "some-org/Big-Model-122B" },
+    "great":   { "base_url": "http://127.0.0.1:12346/v1", "model": "great", "api_key_env": "LMSTUDIO_API_KEY" },
+    "fast":    { "base_url": "http://127.0.0.1:8123/v1", "model": "some-org/Mid-Model-27B" },
+    "instant": { "base_url": "http://127.0.0.1:8200/v1", "model": "some-org/Small-MoE-35B-A3B" }
+  },
+  "audit": {
+    "dir": "/var/log/llm-router-audit",
+    "retain_days": 7,
+    "log_bodies": true,
+    "max_body_bytes": 262144,
+    "log_responses": false
+  },
+  "client_labels": {}
+}
