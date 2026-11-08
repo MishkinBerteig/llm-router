@@ -1,2 +1,6 @@
 # The built binary; `go build -o llm-router .` recreates it.
 /llm-router
+
+# Local build output and host-specific deploy settings
+/build/
+.deploy.env
