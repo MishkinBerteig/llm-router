@@ -21,6 +21,8 @@ to change.
   written.
 - **Fails fast and streams unbuffered.** Long generations are not mistaken for
   hung ones.
+- **Speech-to-text tiers.** A tier can serve OpenAI-style audio transcription
+  uploads. See [Transcription](#transcription).
 
 It was built to serve open-weight models from a Mac Studio (M3 Ultra, 512 GB)
 to a small team's agents and chat UI. See [Example deployment](#example-deployment).
@@ -59,7 +61,8 @@ stored, the change survives a restart.
     "amazing": { "base_url": "http://127.0.0.1:8201/v1", "model": "some-org/Big-Model-122B" },
     "great":   { "base_url": "http://127.0.0.1:12346/v1", "model": "great", "api_key_env": "LMSTUDIO_API_KEY" },
     "fast":    { "base_url": "http://127.0.0.1:8123/v1", "model": "some-org/Mid-Model-27B" },
-    "instant": { "base_url": "http://127.0.0.1:8200/v1", "model": "some-org/Small-MoE-35B-A3B" }
+    "instant": { "base_url": "http://127.0.0.1:8200/v1", "model": "some-org/Small-MoE-35B-A3B" },
+    "transcribe-great": { "base_url": "http://127.0.0.1:8202/v1", "model": "some-org/speech-model-large", "kind": "transcription" }
   }
 }
 ```
@@ -73,6 +76,8 @@ stored, the change survives a restart.
   credentials can sit behind one front door. A tier may have no key at all.
   Some local model servers have no auth of their own, in which case the
   router's front door is the only thing protecting them.
+- **`kind`** is optional per tier: `"chat"` (the default) or `"transcription"`.
+  Any other value is refused on load. See [Transcription](#transcription).
 - **`listen`** must be `0.0.0.0` if a containerised client, such as Open WebUI in
   Docker, reaches the router via `host.docker.internal`. Bind every backend to
   loopback, so the router is the only LLM port exposed beyond the host.
@@ -81,6 +86,9 @@ stored, the change survives a restart.
   `response_header_timeout_ms` has to cover the slowest backend's prefill. A
   large model serving a 512k context can take 20–40 minutes to prefill a
   full-window prompt before its first byte.
+- **`max_upload_bytes`** caps a multipart request body and defaults to 32 MiB.
+  It applies to multipart uploads only, so large JSON requests are unaffected.
+  Like the tier map it hot-reloads. See [Transcription](#transcription).
 - **`verify_response_model`** defaults to on. See [Substitution guard](#substitution-guard).
 
 Unknown JSON fields are rejected on load, so a mistyped key fails loudly
@@ -130,6 +138,77 @@ so streaming is unaffected.
 `"verify_response_model": false` disables the guard without a rebuild, because
 the config hot-reloads.
 
+## Transcription
+
+A tier with `"kind": "transcription"` serves OpenAI's speech-to-text endpoint,
+`POST /v1/audio/transcriptions`, so a client such as the OpenAI SDK can name a
+tier as its `model` and send audio.
+
+```sh
+curl http://127.0.0.1:12345/v1/audio/transcriptions \
+  -H "Authorization: Bearer $KEY" \
+  -F model=transcribe-great -F file=@clip.mp3 -F response_format=text
+```
+
+**Endpoint rules.** Each tier accepts only the endpoint that matches its kind.
+A mismatch is a `400` with outcome `wrong_endpoint`, and the request never
+reaches the backend:
+
+- A transcription tier accepts only `POST /v1/audio/transcriptions`, with a
+  `multipart/form-data` body. A JSON body on that path is a `400`
+  (`bad_multipart`); any other path is `wrong_endpoint`.
+- A chat tier refuses every path under `/v1/audio/` and refuses multipart
+  bodies. Before this rule, a chat backend could answer an audio request with
+  its own error text, or even a `200` carrying an error document.
+- `/v1/models` lists every tier whatever its kind, and `/_tiers` shows each
+  tier's `kind`.
+
+**Multipart handling.** The body is capped at `max_upload_bytes` (default
+32 MiB) before it is read. Over the cap is a `413`, outcome `too_large`.
+The router needs exactly one `model` form field, which may come before or after
+the file:
+
+- none is `400 no_model`;
+- more than one, or a body that is not valid multipart, is `400 bad_multipart`;
+- an unknown tier is the usual `404 unknown_tier`.
+
+The upload is then re-encoded for the backend with the client's own boundary.
+Every part is copied with its headers and content bytes unchanged, except that
+`model` becomes the backend's model name. Header lines within a part may be
+reordered, and a preamble or epilogue is dropped; file contents are identical
+byte for byte. If a client's boundary is one Go's multipart writer will not
+reuse (over 70 characters, say), the backend gets a fresh boundary instead.
+Fields the router does not know about, such as `language`, `prompt` and
+`stream`, are forwarded as they are.
+
+**Replies.** A transcription reply names no model, so it is passed through byte
+for byte, flushed per chunk. The backend-name rewrite and the substitution guard
+are not applied: there is nothing to rewrite, and the guard's stream peek would
+hold back the first events looking for a model name. Streamed replies
+(`stream=true`) therefore arrive as the backend sends them.
+
+**`response_format`.** The backend decides what it can render, so the router
+supports what it can honour:
+
+| Value | Behaviour |
+|---|---|
+| absent, empty or `json` | Passed through. |
+| `text` | The backend is asked for `json`, and a successful reply is returned as `200 text/plain; charset=utf-8` containing only its `text` field. An error status, a reply that is not JSON with a string `text`, or a request with `stream=true` is passed through untouched. |
+| anything else (`srt`, `vtt`, `verbose_json`, `diarized_json`, ...) | `400`, outcome `unsupported_format`. Failing is better than returning JSON to a client expecting subtitles. |
+
+Fields such as `keywords[]` and `languages[]` reach the backend, which may
+ignore them. The router does not translate replies between schemas.
+
+**Audit.** A multipart record has no audio. Instead:
+
+- `files` is a list of `{field, filename, content_type, bytes, sha256}`, one per
+  file part. It is always recorded, so an upload can be matched to its original
+  without the log holding the audio.
+- `request` is an object of the non-file text fields (`model`, `language`,
+  `prompt`, ...), each truncated to `max_body_bytes`. It follows `log_bodies`
+  like any other request body.
+- `req_bytes` is the size of the whole upload.
+
 ## Front-door authentication
 
 There are two independent mechanisms. Both are checked **before** a tier is
@@ -170,8 +249,9 @@ unauthenticated.
 | Endpoint | Purpose |
 |---|---|
 | `GET /v1/models` | The tier names, synthesized. Chat UIs build their model list from this, so it advertises tiers, not backend model names. |
-| `POST /v1/*` | Any request with a `"model"` field is routed and rewritten. |
-| `GET /_tiers` | What the router believes right now: each tier's backend address and model. Requires an API key, because it reveals exactly what the tier names hide. Credentials are never echoed. |
+| `POST /v1/*` | Any request with a `"model"` field is routed and rewritten. JSON for chat tiers. |
+| `POST /v1/audio/transcriptions` | Multipart upload, served by tiers with `"kind": "transcription"`. See [Transcription](#transcription). |
+| `GET /_tiers` | What the router believes right now: each tier's backend address, model and kind. Requires an API key, because it reveals exactly what the tier names hide. Credentials are never echoed. |
 | `GET /healthz` | `ok`. The only route that needs no key, so health checks and process supervisors can use it. |
 
 ## Audit log
@@ -214,8 +294,12 @@ because with bodies turned on the log holds everything everyone typed.
   from (`"outcome":"denied"`). That is usually the most interesting line in the
   file.
 - **`outcome`** is one of `ok`, `denied`, `not_routed`, `unknown_tier`,
-  `bad_json`, `no_model`, `unreadable_body`, `backend_unreachable`,
+  `bad_json`, `no_model`, `unreadable_body`, `wrong_endpoint`, `too_large`,
+  `bad_multipart`, `unsupported_format`, `backend_unreachable`,
   `backend_error`, `model_substituted`, `encode_failed`, `build_failed`.
+- **A body that is not JSON** is recorded as a (truncated) string, so even a
+  malformed request leaves a line. Multipart requests add `files` instead of
+  the audio. See [Transcription](#transcription).
 - **`log_responses`** is off by default. Capturing a stream means buffering the
   whole completion, and the prompt is the part that shows intent.
 
@@ -254,6 +338,7 @@ This is the production setup it was written for: a Mac Studio (M3 Ultra,
                                 +-->  127.0.0.1:12346  LM Studio  great    (also the key verifier)
                                 +-->  127.0.0.1:8123   Splash     fast     (27B)
                                 +-->  127.0.0.1:8200   oMLX       instant  (35B-A3B MoE)
+                                +-->  127.0.0.1:8202   oMLX       transcribe-great / transcribe-fast  (speech-to-text)
 ```
 
 The clients are:

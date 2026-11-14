@@ -23,16 +23,20 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -51,7 +55,30 @@ type Tier struct {
 	// second copy sitting in this file.
 	APIKey    string `json:"api_key,omitempty"`
 	APIKeyEnv string `json:"api_key_env,omitempty"`
+	// What the tier serves: "chat" (the default) for JSON endpoints such as
+	// /v1/chat/completions, or "transcription" for POST /v1/audio/transcriptions.
+	// Declared rather than guessed from the path so that a chat tier can never
+	// be handed an audio upload, nor an audio tier a prompt.
+	Kind string `json:"kind,omitempty"`
 }
+
+const (
+	kindChat          = "chat"
+	kindTranscription = "transcription"
+
+	// The one audio endpoint a transcription tier serves.
+	transcriptionPath = "/v1/audio/transcriptions"
+)
+
+// kind is the effective kind: an omitted one means chat.
+func (t Tier) kind() string {
+	if t.Kind == "" {
+		return kindChat
+	}
+	return t.Kind
+}
+
+func (t Tier) transcription() bool { return t.kind() == kindTranscription }
 
 // key resolves the backend credential, environment first.
 func (t Tier) key() string {
@@ -115,6 +142,12 @@ type Config struct {
 	// prefill on a long prompt against a large model legitimately takes
 	// minutes before anything comes back.
 	ResponseHeaderTimeoutMS int `json:"response_header_timeout_ms,omitempty"`
+
+	// Cap on a multipart request body, i.e. an audio upload. Applies to
+	// multipart only: JSON bodies stay uncapped, because a long-context or
+	// vision request is legitimately enormous. The default is a little over
+	// OpenAI's own 25 MB limit for transcription uploads.
+	MaxUploadBytes int `json:"max_upload_bytes,omitempty"`
 }
 
 // An Audit configures the request log. One JSON object per line, one file per
@@ -409,6 +442,13 @@ func (c *Config) dialTimeout() time.Duration {
 	return 2 * time.Second
 }
 
+func (c *Config) maxUpload() int64 {
+	if c.MaxUploadBytes > 0 {
+		return int64(c.MaxUploadBytes)
+	}
+	return 32 << 20
+}
+
 func (c *Config) headerTimeout() time.Duration {
 	if c.ResponseHeaderTimeoutMS > 0 {
 		return time.Duration(c.ResponseHeaderTimeoutMS) * time.Millisecond
@@ -451,6 +491,13 @@ func loadConfig(path string) (*Config, error) {
 		if err != nil || u.Scheme == "" || u.Host == "" {
 			return nil, fmt.Errorf("tier %q has an unusable base_url %q", name, t.BaseURL)
 		}
+		if t.Kind != "" && t.Kind != kindChat && t.Kind != kindTranscription {
+			return nil, fmt.Errorf("tier %q has unknown kind %q (want %q or %q)",
+				name, t.Kind, kindChat, kindTranscription)
+		}
+	}
+	if c.MaxUploadBytes < 0 {
+		return nil, fmt.Errorf("max_upload_bytes must not be negative")
 	}
 	return &c, nil
 }
@@ -492,7 +539,11 @@ func describe(c *Config) string {
 	parts := make([]string, 0, len(names))
 	for _, n := range names {
 		t := c.Tiers[n]
-		parts = append(parts, fmt.Sprintf("%s -> %s [%s]", n, t.BaseURL, t.Model))
+		line := fmt.Sprintf("%s -> %s [%s]", n, t.BaseURL, t.Model)
+		if t.transcription() {
+			line += " (" + kindTranscription + ")"
+		}
+		parts = append(parts, line)
 	}
 	return strings.Join(parts, ", ")
 }
@@ -746,6 +797,181 @@ func target(base, path string) string {
 	return strings.TrimRight(base, "/") + strings.TrimPrefix(path, "/v1")
 }
 
+// An uploadedFile is what the audit log keeps of a file part: who sent what,
+// how big, and a hash to match it against the original. The bytes themselves
+// are never recorded.
+type uploadedFile struct {
+	Field       string `json:"field"`
+	Filename    string `json:"filename"`
+	ContentType string `json:"content_type,omitempty"`
+	Bytes       int64  `json:"bytes"`
+	SHA256      string `json:"sha256"`
+}
+
+// A multipartForm is what routing needs to know about an upload: every
+// non-file field, and a summary of each file.
+type multipartForm struct {
+	fields map[string][]string
+	files  []uploadedFile
+}
+
+// multipartBoundary reports whether the request is a multipart/form-data
+// upload, and its boundary. Detection is by Content-Type alone, before any
+// body is read, so the upload cap can be applied to exactly these requests.
+func multipartBoundary(r *http.Request) (string, bool) {
+	mt, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || mt != "multipart/form-data" || params["boundary"] == "" {
+		return "", false
+	}
+	return params["boundary"], true
+}
+
+// parseMultipart reads the fields and file summaries out of an upload. It uses
+// NextRawPart so quoted-printable parts are never decoded: nothing here may
+// alter bytes that will be forwarded. On error it still returns what it parsed
+// so far, which the audit log can use.
+func parseMultipart(body []byte, boundary string) (*multipartForm, error) {
+	form := &multipartForm{fields: map[string][]string{}, files: []uploadedFile{}}
+	mr := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		part, err := mr.NextRawPart()
+		if err == io.EOF {
+			return form, nil
+		}
+		if err != nil {
+			return form, err
+		}
+		if part.FileName() == "" {
+			val, err := io.ReadAll(part)
+			if err != nil {
+				return form, err
+			}
+			form.fields[part.FormName()] = append(form.fields[part.FormName()], string(val))
+			continue
+		}
+		h := sha256.New()
+		n, err := io.Copy(h, part)
+		if err != nil {
+			return form, err
+		}
+		form.files = append(form.files, uploadedFile{
+			Field:       part.FormName(),
+			Filename:    part.FileName(),
+			ContentType: part.Header.Get("Content-Type"),
+			Bytes:       n,
+			SHA256:      hex.EncodeToString(h.Sum(nil)),
+		})
+	}
+}
+
+// rewriteMultipart re-encodes an upload for the backend: the "model" field
+// becomes the backend's model name and, if format is set, "response_format"
+// becomes that. Every other part is copied with its headers and content bytes
+// untouched, and the client's boundary is kept so the body stays as close to
+// what was sent as the format allows. Part headers are written in sorted
+// order, which may differ from the original; the content never does.
+func rewriteMultipart(body []byte, boundary, model, format string) ([]byte, string, error) {
+	var out bytes.Buffer
+	mw := multipart.NewWriter(&out)
+	// A boundary the writer will not accept (it is stricter than the RFC about
+	// length and characters) falls back to the writer's own random one. Still
+	// correct, since the Content-Type below names whichever is in use.
+	if err := mw.SetBoundary(boundary); err != nil {
+		log.Printf("multipart: keeping own boundary, client's is not reusable: %v", err)
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), boundary)
+	for {
+		part, err := mr.NextRawPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		var replace *string
+		if part.FileName() == "" {
+			switch part.FormName() {
+			case "model":
+				replace = &model
+			case "response_format":
+				if format != "" {
+					replace = &format
+				}
+			}
+		}
+		hdr := part.Header
+		if replace != nil {
+			// The new value is written as-is, so a transfer encoding that
+			// described the old one would now be a lie.
+			hdr.Del("Content-Transfer-Encoding")
+		}
+		w, err := mw.CreatePart(hdr)
+		if err != nil {
+			return nil, "", err
+		}
+		if replace != nil {
+			if _, err := io.Copy(io.Discard, part); err != nil {
+				return nil, "", err
+			}
+			_, err = io.WriteString(w, *replace)
+		} else {
+			_, err = io.Copy(w, part)
+		}
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, "", err
+	}
+	ctype := mime.FormatMediaType("multipart/form-data", map[string]string{"boundary": mw.Boundary()})
+	if ctype == "" {
+		ctype = "multipart/form-data; boundary=" + mw.Boundary()
+	}
+	return out.Bytes(), ctype, nil
+}
+
+// truthy reads a form boolean the way the backends do, loosely.
+func truthy(v string) bool {
+	if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+		return b
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "yes", "on":
+		return true
+	}
+	return false
+}
+
+// auditBody picks how a request body is stored. Raw JSON only when it really is
+// JSON: json.Marshal fails on an invalid RawMessage, and a record that cannot
+// be marshalled is silently dropped, which loses exactly the malformed requests
+// worth seeing.
+func auditBody(body []byte, max int) (v any, truncated bool) {
+	if len(body) > max {
+		return string(body[:max]), true
+	}
+	if json.Valid(body) {
+		return json.RawMessage(body), false
+	}
+	return string(body), false
+}
+
+// newHTTPClient builds the client for the proxy path and the key verifier.
+func newHTTPClient(c *Config) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: c.dialTimeout()}).DialContext,
+			ResponseHeaderTimeout: c.headerTimeout(),
+			// Asking for gzip would invite the backend to buffer a stream
+			// before compressing it, which is exactly what SSE must not do.
+			DisableCompression: true,
+		},
+		// No overall deadline: a long generation is not a stuck one.
+		Timeout: 0,
+	}
+}
+
 func main() {
 	configPath := flag.String("config", "", "path to the routing config (required)")
 	flag.Parse()
@@ -765,18 +991,32 @@ func main() {
 	}
 	go watch(*configPath, 2*time.Second)
 
-	httpClient = &http.Client{
-		Transport: &http.Transport{
-			DialContext:           (&net.Dialer{Timeout: c.dialTimeout()}).DialContext,
-			ResponseHeaderTimeout: c.headerTimeout(),
-			// Asking for gzip would invite the backend to buffer a stream
-			// before compressing it, which is exactly what SSE must not do.
-			DisableCompression: true,
-		},
-		// No overall deadline: a long generation is not a stuck one.
-		Timeout: 0,
-	}
+	httpClient = newHTTPClient(c)
 
+	srv := &http.Server{
+		Addr:    c.Listen,
+		Handler: newMux(),
+		// Both zero on purpose: a request may stream for an hour, and a
+		// write deadline would cut a long generation off mid-sentence.
+		ReadTimeout:  0,
+		WriteTimeout: 0,
+		IdleTimeout:  120 * time.Second,
+	}
+	log.Printf("llm-router on %s", c.Listen)
+	log.Printf("routing: %s", describe(c))
+	if audit != nil {
+		log.Printf("audit: %s, retain %d days, bodies=%v, responses=%v",
+			c.Audit.Dir, c.Audit.retain(), c.Audit.bodies(), c.Audit.LogResponses)
+	} else {
+		log.Printf("audit: DISABLED (no audit.dir configured)")
+	}
+	log.Fatal(srv.ListenAndServe())
+}
+
+// newMux registers every route. It reads the live config, audit log and client
+// through the package globals on each request, so a reload takes effect
+// without rebuilding the mux.
+func newMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -799,7 +1039,7 @@ func main() {
 		defer finish(rec, start, http.StatusOK, "ok")
 		out := map[string]any{}
 		for n, t := range cfg.Tiers {
-			out[n] = map[string]string{"base_url": t.BaseURL, "model": t.Model}
+			out[n] = map[string]string{"base_url": t.BaseURL, "model": t.Model, "kind": t.kind()}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"tiers": out})
@@ -851,37 +1091,97 @@ func main() {
 			finish(rec, start, http.StatusNotFound, "not_routed")
 			return
 		}
-		body, err := io.ReadAll(r.Body)
+		// An upload is recognised by its Content-Type, before the body is
+		// read, so the cap below applies to exactly those requests.
+		boundary, isMultipart := multipartBoundary(r)
+		src := r.Body
+		if isMultipart {
+			src = http.MaxBytesReader(w, r.Body, cfg.maxUpload())
+		}
+		body, err := io.ReadAll(src)
 		if err != nil {
+			var tooBig *http.MaxBytesError
+			if errors.As(err, &tooBig) {
+				writeErr(w, http.StatusRequestEntityTooLarge,
+					"upload exceeds the %d byte limit", tooBig.Limit)
+				finish(rec, start, http.StatusRequestEntityTooLarge, "too_large")
+				return
+			}
 			writeErr(w, http.StatusBadRequest, "could not read request body: %v", err)
 			finish(rec, start, http.StatusBadRequest, "unreadable_body")
 			return
 		}
 		if rec != nil {
 			rec["req_bytes"] = len(body)
-			if cfg.Audit != nil && cfg.Audit.bodies() {
+		}
+
+		var requested string
+		var form *multipartForm
+		var fields map[string]json.RawMessage
+		if isMultipart {
+			var perr error
+			form, perr = parseMultipart(body, boundary)
+			if rec != nil {
+				// File metadata always, and never the audio itself. The text
+				// fields (prompt, language, ...) are the part that shows what
+				// was asked for, so they follow the same log_bodies switch as
+				// a JSON prompt does.
+				rec["files"] = form.files
+				if cfg.Audit != nil && cfg.Audit.bodies() {
+					max := cfg.Audit.maxBody()
+					req := map[string]any{}
+					for name, vals := range form.fields {
+						cut := make([]string, len(vals))
+						for i, v := range vals {
+							if len(v) > max {
+								v = v[:max]
+							}
+							cut[i] = v
+						}
+						if len(cut) == 1 {
+							req[name] = cut[0]
+						} else {
+							req[name] = cut
+						}
+					}
+					rec["request"] = req
+				}
+			}
+			if perr != nil {
+				writeErr(w, http.StatusBadRequest, "request body is not valid multipart/form-data: %v", perr)
+				finish(rec, start, http.StatusBadRequest, "bad_multipart")
+				return
+			}
+			models := form.fields["model"]
+			if len(models) > 1 {
+				writeErr(w, http.StatusBadRequest, "request has more than one \"model\" field")
+				finish(rec, start, http.StatusBadRequest, "bad_multipart")
+				return
+			}
+			if len(models) == 1 {
+				requested = models[0]
+			}
+		} else {
+			if rec != nil && cfg.Audit != nil && cfg.Audit.bodies() {
 				// The prompt itself, as raw JSON so it stays structured in
 				// the record rather than becoming an escaped blob. Truncated
 				// with a marker so a record is never silently partial.
-				if max := cfg.Audit.maxBody(); len(body) > max {
-					rec["request"] = string(body[:max])
+				v, truncated := auditBody(body, cfg.Audit.maxBody())
+				rec["request"] = v
+				if truncated {
 					rec["request_truncated"] = true
-				} else {
-					rec["request"] = json.RawMessage(body)
 				}
 			}
-		}
-		// Decode into raw values so every field but "model" is forwarded
-		// byte-for-byte: no number reformatting, no dropped keys.
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(body, &fields); err != nil {
-			writeErr(w, http.StatusBadRequest, "request body is not a JSON object: %v", err)
-			finish(rec, start, http.StatusBadRequest, "bad_json")
-			return
-		}
-		var requested string
-		if raw, ok := fields["model"]; ok {
-			json.Unmarshal(raw, &requested)
+			// Decode into raw values so every field but "model" is forwarded
+			// byte-for-byte: no number reformatting, no dropped keys.
+			if err := json.Unmarshal(body, &fields); err != nil {
+				writeErr(w, http.StatusBadRequest, "request body is not a JSON object: %v", err)
+				finish(rec, start, http.StatusBadRequest, "bad_json")
+				return
+			}
+			if raw, ok := fields["model"]; ok {
+				json.Unmarshal(raw, &requested)
+			}
 		}
 		if requested == "" {
 			writeErr(w, http.StatusBadRequest, "request has no \"model\" field to route on")
@@ -908,23 +1208,95 @@ func main() {
 			rec["backend"] = tier.BaseURL
 			rec["backend_model"] = tier.Model
 		}
-		// The one rewrite that makes tiers work.
-		renamed, err := json.Marshal(tier.Model)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "could not encode model name: %v", err)
-			finish(rec, start, http.StatusInternalServerError, "encode_failed")
-			return
-		}
-		fields["model"] = renamed
-		outBody, err := json.Marshal(fields)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, "could not re-encode request: %v", err)
-			finish(rec, start, http.StatusInternalServerError, "encode_failed")
+		// Which endpoint a tier may be used on is part of its definition. A chat
+		// tier handed to the audio path used to reach the backend, which
+		// answered 200 with an error document (or a 404/422 naming its own
+		// internals); refusing here keeps backend text out of the reply and the
+		// audit outcome honest.
+		if tier.transcription() {
+			switch {
+			case r.URL.Path != transcriptionPath:
+				writeErr(w, http.StatusBadRequest,
+					"tier %q is a transcription tier: POST %s with a multipart/form-data body", requested, transcriptionPath)
+				finish(rec, start, http.StatusBadRequest, "wrong_endpoint")
+				return
+			case !isMultipart:
+				writeErr(w, http.StatusBadRequest,
+					"tier %q: transcription requests must be multipart/form-data", requested)
+				finish(rec, start, http.StatusBadRequest, "bad_multipart")
+				return
+			}
+		} else if isMultipart || strings.HasPrefix(r.URL.Path, "/v1/audio/") {
+			writeErr(w, http.StatusBadRequest,
+				"tier %q is a chat tier: send JSON to its chat endpoints such as /v1/chat/completions; audio transcription is served by a transcription tier at %s",
+				requested, transcriptionPath)
+			finish(rec, start, http.StatusBadRequest, "wrong_endpoint")
 			return
 		}
 
+		// response_format: the backend always answers JSON whatever is asked,
+		// so the router supports what it can honour. "text" is plain text
+		// derived from that JSON; everything else needs a backend that renders
+		// it, and failing loudly beats returning JSON to a client expecting SRT.
+		var wantText, streaming bool
+		if tier.transcription() {
+			formats := form.fields["response_format"]
+			if len(formats) > 1 {
+				writeErr(w, http.StatusBadRequest, "request has more than one \"response_format\" field")
+				finish(rec, start, http.StatusBadRequest, "bad_multipart")
+				return
+			}
+			if len(formats) == 1 {
+				switch formats[0] {
+				case "", "json":
+				case "text":
+					wantText = true
+				default:
+					writeErr(w, http.StatusBadRequest,
+						"tier %q supports response_format \"json\" and \"text\", not %q", requested, formats[0])
+					finish(rec, start, http.StatusBadRequest, "unsupported_format")
+					return
+				}
+			}
+			for _, v := range form.fields["stream"] {
+				streaming = streaming || truthy(v)
+			}
+		}
+
+		var outBody []byte
+		var outType string
+		if isMultipart {
+			format := ""
+			if wantText {
+				// Ask the backend for JSON and derive the text from it.
+				format = "json"
+			}
+			outBody, outType, err = rewriteMultipart(body, boundary, tier.Model, format)
+			if err != nil {
+				writeErr(w, http.StatusBadRequest, "request body is not valid multipart/form-data: %v", err)
+				finish(rec, start, http.StatusBadRequest, "bad_multipart")
+				return
+			}
+		} else {
+			// The one rewrite that makes tiers work.
+			renamed, err := json.Marshal(tier.Model)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "could not encode model name: %v", err)
+				finish(rec, start, http.StatusInternalServerError, "encode_failed")
+				return
+			}
+			fields["model"] = renamed
+			outBody, err = json.Marshal(fields)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "could not re-encode request: %v", err)
+				finish(rec, start, http.StatusInternalServerError, "encode_failed")
+				return
+			}
+			outType = "application/json"
+		}
+
 		dest := target(tier.BaseURL, r.URL.Path)
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, dest, strings.NewReader(string(outBody)))
+		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, dest, bytes.NewReader(outBody))
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, "could not build backend request: %v", err)
 			finish(rec, start, http.StatusInternalServerError, "build_failed")
@@ -945,7 +1317,7 @@ func main() {
 				req.Header.Add(name, v)
 			}
 		}
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", outType)
 		req.ContentLength = int64(len(outBody))
 		if k := tier.key(); k != "" {
 			req.Header.Set("Authorization", "Bearer "+k)
@@ -972,18 +1344,42 @@ func main() {
 		ctype := resp.Header.Get("Content-Type")
 		isSSE := strings.Contains(ctype, "text/event-stream")
 		isJSON := strings.Contains(ctype, "application/json")
-		unleaking := tier.Model != requested && (isSSE || isJSON)
+		//
+		// Not for a transcription tier: its replies name no model, so there is
+		// nothing to rewrite, and the substitution peek below would hold back up
+		// to 16 lines of an event stream looking for one.
+		unleaking := !tier.transcription() && tier.Model != requested && (isSSE || isJSON)
 
 		// Whether to assert the backend answered as the model we asked for.
 		// Only for successful, parseable replies: an error body has no model
 		// to check.
-		checking := cfg.verifyModel() && resp.StatusCode < 400 && (isSSE || isJSON)
+		checking := !tier.transcription() && cfg.verifyModel() && resp.StatusCode < 400 && (isSSE || isJSON)
+
+		// response_format=text: only a successful, non-streamed JSON reply is
+		// converted. An error keeps its envelope and status so the client sees
+		// what went wrong, and a stream has no single text to return.
+		convertText := wantText && !streaming && resp.StatusCode >= 200 && resp.StatusCode < 300 && isJSON
 
 		var buffered []byte
+		var converted bool
 		var sseHead []byte
 		var served string
 
 		switch {
+		case convertText:
+			raw, readErr := io.ReadAll(resp.Body)
+			buffered = raw
+			if readErr == nil {
+				var doc struct {
+					Text *string `json:"text"`
+				}
+				// No string "text" means this is not the reply we know how to
+				// convert, so it goes through untouched.
+				if json.Unmarshal(raw, &doc) == nil && doc.Text != nil {
+					buffered = append([]byte{}, *doc.Text...)
+					converted = true
+				}
+			}
 		case (unleaking || checking) && !isSSE:
 			// A non-streamed reply is one bounded JSON document, so buffer it,
 			// inspect, rewrite, and send a correct Content-Length. Nothing is
@@ -1031,7 +1427,10 @@ func main() {
 			if hopByHop[canonical] {
 				continue
 			}
-			if unleaking && canonical == "Content-Length" {
+			if (unleaking || converted) && canonical == "Content-Length" {
+				continue
+			}
+			if converted && canonical == "Content-Type" {
 				continue
 			}
 			for _, v := range values {
@@ -1043,7 +1442,12 @@ func main() {
 		if buffered != nil {
 			w.Header().Set("Content-Length", fmt.Sprint(len(buffered)))
 		}
-		w.WriteHeader(resp.StatusCode)
+		status := resp.StatusCode
+		if converted {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			status = http.StatusOK
+		}
+		w.WriteHeader(status)
 		f, _ := w.(http.Flusher)
 		var dst io.Writer = flushWriter{w: w, f: f}
 		var capture *cappedBuffer
@@ -1080,22 +1484,5 @@ func main() {
 		finish(rec, start, resp.StatusCode, outcome)
 	})
 
-	srv := &http.Server{
-		Addr:    c.Listen,
-		Handler: mux,
-		// Both zero on purpose: a request may stream for an hour, and a
-		// write deadline would cut a long generation off mid-sentence.
-		ReadTimeout:  0,
-		WriteTimeout: 0,
-		IdleTimeout:  120 * time.Second,
-	}
-	log.Printf("llm-router on %s", c.Listen)
-	log.Printf("routing: %s", describe(c))
-	if audit != nil {
-		log.Printf("audit: %s, retain %d days, bodies=%v, responses=%v",
-			c.Audit.Dir, c.Audit.retain(), c.Audit.bodies(), c.Audit.LogResponses)
-	} else {
-		log.Printf("audit: DISABLED (no audit.dir configured)")
-	}
-	log.Fatal(srv.ListenAndServe())
+	return mux
 }
