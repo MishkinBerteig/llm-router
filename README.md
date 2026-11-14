@@ -191,6 +191,15 @@ are not applied: there is nothing to rewrite, and the guard's stream peek would
 hold back the first events looking for a model name. Streamed replies
 (`stream=true`) therefore arrive as the backend sends them.
 
+**Language names.** Clients expect ISO 639-1 codes (`"en"`) in a reply's
+`language`, but some backends return the name (`"English"`). For a successful,
+non-streamed JSON reply, a top-level `language` that is a string naming a known
+language (case-insensitive) is replaced with its code, and every other field is
+kept as the backend sent it. Anything else passes through byte for byte: an
+existing code, `null`, a missing or non-string field, a name the router does not
+know, and Cantonese, which has no ISO 639-1 code. Streams, error replies and
+`response_format=text` are untouched.
+
 **`response_format`.** The backend decides what it can render, so the router
 supports what it can honour:
 
@@ -297,6 +306,9 @@ because with bodies turned on the log holds everything everyone typed.
 - **Rejections are recorded** with the key ID that was tried and where it came
   from (`"outcome":"denied"`). That is usually the most interesting line in the
   file.
+- **`language_normalized`** is `true` when the router rewrote a transcription
+  reply's `language` to an ISO code. It is metadata, so `log_bodies: false`
+  keeps it.
 - **`outcome`** is one of `ok`, `denied`, `not_routed`, `unknown_tier`,
   `bad_json`, `no_model`, `unreadable_body`, `wrong_endpoint`, `too_large`,
   `bad_multipart`, `unsupported_format`, `backend_unreachable`,

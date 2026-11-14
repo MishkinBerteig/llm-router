@@ -1403,8 +1403,15 @@ func newMux() *http.ServeMux {
 		// what went wrong, and a stream has no single text to return.
 		convertText := wantText && !streaming && resp.StatusCode >= 200 && resp.StatusCode < 300 && isJSON
 
+		// A transcription reply's "language" is normalised to an ISO 639-1
+		// code. Streams and error bodies are left alone, and so is a reply
+		// already headed for text conversion.
+		normalizeLang := tier.transcription() && !streaming && !convertText &&
+			resp.StatusCode >= 200 && resp.StatusCode < 300 && isJSON
+
 		var buffered []byte
 		var converted bool
+		var langNormalized bool
 		var sseHead []byte
 		var served string
 
@@ -1421,6 +1428,17 @@ func newMux() *http.ServeMux {
 				if json.Unmarshal(raw, &doc) == nil && doc.Text != nil {
 					buffered = append([]byte{}, *doc.Text...)
 					converted = true
+				}
+			}
+		case normalizeLang:
+			// One bounded document, so buffering it delays nothing. A body
+			// that needs no change is sent back exactly as it arrived.
+			raw, readErr := io.ReadAll(resp.Body)
+			buffered = raw
+			if readErr == nil {
+				if out, ok := normalizeLanguage(raw); ok {
+					buffered = out
+					langNormalized = true
 				}
 			}
 		case (unleaking || checking) && !isSSE:
@@ -1470,7 +1488,7 @@ func newMux() *http.ServeMux {
 			if hopByHop[canonical] {
 				continue
 			}
-			if (unleaking || converted) && canonical == "Content-Length" {
+			if (unleaking || converted || langNormalized) && canonical == "Content-Length" {
 				continue
 			}
 			if converted && canonical == "Content-Type" {
@@ -1510,6 +1528,10 @@ func newMux() *http.ServeMux {
 		}
 		if rec != nil {
 			rec["unleaked"] = unleaking
+			if langNormalized {
+				// Metadata, not content, so it is kept even with log_bodies off.
+				rec["language_normalized"] = true
+			}
 		}
 		if rec != nil {
 			rec["resp_bytes"] = n
@@ -1528,4 +1550,50 @@ func newMux() *http.ServeMux {
 	})
 
 	return mux
+}
+
+// languageCodes maps language names to ISO 639-1 codes. Clients expect
+// OpenAI's ISO codes in a transcription reply's "language", but some backends
+// (Qwen3-ASR, for one) return the English name. Cantonese is left out on
+// purpose: it has no ISO 639-1 code, so it passes through unchanged.
+var languageCodes = map[string]string{
+	"arabic": "ar", "bulgarian": "bg", "catalan": "ca", "chinese": "zh",
+	"croatian": "hr", "czech": "cs", "danish": "da", "dutch": "nl",
+	"english": "en", "estonian": "et", "filipino": "tl", "finnish": "fi",
+	"french": "fr", "german": "de", "greek": "el", "hebrew": "he",
+	"hindi": "hi", "hungarian": "hu", "indonesian": "id", "italian": "it",
+	"japanese": "ja", "korean": "ko", "latvian": "lv", "lithuanian": "lt",
+	"macedonian": "mk", "malay": "ms", "norwegian": "no", "persian": "fa",
+	"polish": "pl", "portuguese": "pt", "romanian": "ro", "russian": "ru",
+	"slovak": "sk", "slovenian": "sl", "spanish": "es", "swedish": "sv",
+	"thai": "th", "turkish": "tr", "ukrainian": "uk", "vietnamese": "vi",
+	"welsh": "cy",
+}
+
+// normalizeLanguage replaces a top-level string "language" that names a known
+// language with its ISO 639-1 code. It reports false, and the caller keeps the
+// original bytes, for anything else: a code, null, a missing or non-string
+// field, an unknown name, or a body that is not a JSON object. Only "language"
+// is replaced; every other field keeps its raw bytes.
+func normalizeLanguage(raw []byte) ([]byte, bool) {
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(raw, &doc) != nil {
+		return nil, false
+	}
+	var name string
+	if lang, ok := doc["language"]; !ok || json.Unmarshal(lang, &name) != nil {
+		return nil, false
+	}
+	code, ok := languageCodes[strings.ToLower(strings.TrimSpace(name))]
+	if !ok {
+		return nil, false
+	}
+	doc["language"], _ = json.Marshal(code)
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false) // keep the other fields' text as the backend wrote it
+	if enc.Encode(doc) != nil {
+		return nil, false
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), true
 }

@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1284,5 +1285,140 @@ func TestTierLogBodiesVisibility(t *testing.T) {
 	srv2 := router(t, &Config{Tiers: map[string]Tier{"great": {BaseURL: "http://127.0.0.1:1/v1", Model: "g"}}})
 	if got := tiersOf(srv2.URL)["great"]["log_bodies"]; got != false {
 		t.Errorf("no audit: %v", got)
+	}
+}
+
+// --- language normalisation ------------------------------------------------
+
+func langBackend(t *testing.T, status int, ctype, reply string) *stub {
+	return newStub(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.Header().Set("Content-Type", ctype)
+		w.WriteHeader(status)
+		io.WriteString(w, reply)
+	})
+}
+
+func langUpload(t *testing.T, srv *httptest.Server, extra ...formPart) (*http.Response, []byte) {
+	t.Helper()
+	body, ctype := uploadWith(t, extra...)
+	return post(t, srv.URL+"/v1/audio/transcriptions", ctype, body, true)
+}
+
+func TestLanguageNormalizedToCode(t *testing.T) {
+	const reply = `{"text":"Hi <b> & é","language":"English","duration":1.50,"segments":[{"id":0}]}`
+	srv := router(t, transcribeCfg(langBackend(t, 200, "application/json", reply)))
+	resp, raw := langUpload(t, srv)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status %d: %s", resp.StatusCode, raw)
+	}
+	if resp.ContentLength != int64(len(raw)) || resp.Header.Get("Content-Length") != strconv.Itoa(len(raw)) {
+		t.Errorf("Content-Length %q, body %d bytes", resp.Header.Get("Content-Length"), len(raw))
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("%v: %s", err, raw)
+	}
+	want := map[string]string{"text": `"Hi <b> & é"`, "language": `"en"`, "duration": `1.50`, "segments": `[{"id":0}]`}
+	if len(got) != len(want) {
+		t.Errorf("fields: %s", raw)
+	}
+	for k, v := range want {
+		if string(got[k]) != v {
+			t.Errorf("%s = %s, want %s", k, got[k], v)
+		}
+	}
+}
+
+func TestLanguagePassThroughAndLowerCase(t *testing.T) {
+	same := []string{
+		`{"text":"x","language":"en"}`,
+		`{"text":"x","language":null}`,
+		`{"text":"x"}`,
+		`{"text":"x","language":"Cantonese"}`,
+		`{"text":"x","language":"Klingon"}`,
+		`{"text":"x","language":12}`,
+		"{ \"text\": \"x\",\n \"language\" : \"Klingon\" }",
+	}
+	for _, reply := range same {
+		srv := router(t, transcribeCfg(langBackend(t, 200, "application/json", reply)))
+		resp, raw := langUpload(t, srv)
+		if resp.StatusCode != 200 || string(raw) != reply {
+			t.Errorf("%s: got %d %q", reply, resp.StatusCode, raw)
+		}
+	}
+	for _, name := range []string{"english", " ENGLISH ", "English"} {
+		reply := `{"text":"x","language":"` + name + `"}`
+		srv := router(t, transcribeCfg(langBackend(t, 200, "application/json", reply)))
+		_, raw := langUpload(t, srv)
+		var got struct{ Language string }
+		json.Unmarshal(raw, &got)
+		if got.Language != "en" {
+			t.Errorf("%q -> %s", name, raw)
+		}
+	}
+}
+
+func TestLanguageUntouchedOnError(t *testing.T) {
+	const reply = `{"error":"nope","language":"English"}`
+	srv := router(t, transcribeCfg(langBackend(t, 500, "application/json", reply)))
+	resp, raw := langUpload(t, srv)
+	if resp.StatusCode != 500 || string(raw) != reply {
+		t.Errorf("got %d %q", resp.StatusCode, raw)
+	}
+}
+
+func TestLanguageTextFormatStillOnlyText(t *testing.T) {
+	srv := router(t, transcribeCfg(langBackend(t, 200, "application/json", `{"text":"hello","language":"English"}`)))
+	resp, raw := langUpload(t, srv, formPart{name: "response_format", data: []byte("text")})
+	if resp.StatusCode != 200 || string(raw) != "hello" {
+		t.Errorf("got %d %q", resp.StatusCode, raw)
+	}
+}
+
+func TestLanguageStreamUntouched(t *testing.T) {
+	const reply = "data: {\"type\":\"transcript.text.done\",\"text\":\"Hello\",\"language\":\"English\"}\n\n"
+	srv := router(t, transcribeCfg(langBackend(t, 200, "text/event-stream", reply)))
+	resp, raw := langUpload(t, srv, formPart{name: "stream", data: []byte("true")})
+	if resp.StatusCode != 200 || string(raw) != reply {
+		t.Errorf("got %d %q", resp.StatusCode, raw)
+	}
+}
+
+func TestLanguageChatTierUntouched(t *testing.T) {
+	// Backend model equals the tier name, so the leak rewrite has nothing to do.
+	const reply = `{"model":"great","language":"English","choices":[]}`
+	back := langBackend(t, 200, "application/json", reply)
+	cfg := &Config{Tiers: map[string]Tier{"great": {BaseURL: back.URL + "/v1", Model: "great"}}}
+	srv := router(t, cfg)
+	resp, raw := post(t, srv.URL+"/v1/chat/completions", "application/json",
+		[]byte(`{"model":"great","messages":[{"role":"user","content":"hi"}]}`), true)
+	if resp.StatusCode != 200 || string(raw) != reply {
+		t.Errorf("got %d %q", resp.StatusCode, raw)
+	}
+}
+
+func TestLanguageNormalizedAudit(t *testing.T) {
+	for _, tc := range []struct {
+		reply string
+		want  bool
+	}{
+		{`{"text":"x","language":"English"}`, true},
+		{`{"text":"x","language":"en"}`, false},
+	} {
+		dir := t.TempDir()
+		cfg := transcribeCfg(langBackend(t, 200, "application/json", tc.reply))
+		t0 := cfg.Tiers["transcribe-great"]
+		t0.LogBodies = boolp(false)
+		cfg.Tiers["transcribe-great"] = t0
+		cfg.Audit = &Audit{Dir: dir}
+		srv := router(t, cfg)
+		if resp, raw := langUpload(t, srv); resp.StatusCode != 200 {
+			t.Fatalf("status %d: %s", resp.StatusCode, raw)
+		}
+		rec := auditRecords(t, dir, 1)[0]
+		got, present := rec["language_normalized"]
+		if tc.want && got != true || !tc.want && present {
+			t.Errorf("%s: language_normalized = %v (present %v)", tc.reply, got, present)
+		}
 	}
 }
