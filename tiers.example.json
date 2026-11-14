@@ -8,8 +8,8 @@
     "great":   { "base_url": "http://127.0.0.1:12346/v1", "model": "great", "api_key_env": "LMSTUDIO_API_KEY" },
     "fast":    { "base_url": "http://127.0.0.1:8123/v1", "model": "some-org/Mid-Model-27B" },
     "instant": { "base_url": "http://127.0.0.1:8200/v1", "model": "some-org/Small-MoE-35B-A3B" },
-    "transcribe-great": { "base_url": "http://127.0.0.1:8202/v1", "model": "some-org/speech-model-large", "kind": "transcription" },
-    "transcribe-fast":  { "base_url": "http://127.0.0.1:8202/v1", "model": "some-org/speech-model-small", "kind": "transcription" }
+    "transcribe-great": { "base_url": "http://127.0.0.1:8202/v1", "model": "some-org/speech-model-large", "kind": "transcription", "log_bodies": false },
+    "transcribe-fast":  { "base_url": "http://127.0.0.1:8202/v1", "model": "some-org/speech-model-small", "kind": "transcription", "log_bodies": false }
   },
   "audit": {
     "dir": "/var/log/llm-router-audit",

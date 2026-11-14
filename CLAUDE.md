@@ -29,7 +29,7 @@ usernames or real people's names. Host-specific settings live in the gitignored
   touched by a deploy. The tier map hot-reloads. The timeouts need a restart.
 - **Ordering rule.** An old binary rejects unknown config fields, and at startup
   that is fatal (a `KeepAlive` crash loop that takes every tier down). So deploy
-  the new binary **before** adding `kind` or `max_upload_bytes` to the live
+  the new binary **before** adding `kind`, tier `log_bodies` or `max_upload_bytes` to the live
   config, and remove them from the live config **before** rolling the binary
   back. On a hot reload an old binary only refuses the edit, which is harmless.
 

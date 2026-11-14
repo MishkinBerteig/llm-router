@@ -610,7 +610,7 @@ func TestTiersAndModelsListing(t *testing.T) {
 		return raw
 	}
 	var tiers struct {
-		Tiers map[string]map[string]string `json:"tiers"`
+		Tiers map[string]map[string]any `json:"tiers"`
 	}
 	json.Unmarshal(get("/_tiers"), &tiers)
 	if tiers.Tiers["transcribe-great"]["kind"] != "transcription" || tiers.Tiers["great"]["kind"] != "chat" {
@@ -1109,5 +1109,180 @@ func TestBackendUnreachable(t *testing.T) {
 	}
 	if got := lastOutcome(t, cfg.Audit.Dir, 2); got != "backend_unreachable" {
 		t.Errorf("outcome %q", got)
+	}
+}
+
+// --- per-tier log_bodies ---------------------------------------------------
+
+func boolp(b bool) *bool { return &b }
+
+// tierBodiesRun sends one transcription or chat request through a router whose
+// audit has the given global settings, and returns the single audit record.
+func tierBodiesRun(t *testing.T, transcribe bool, tierSwitch *bool, global *bool, responses bool) map[string]any {
+	t.Helper()
+	dir := t.TempDir()
+	var cfg *Config
+	var path, ctype string
+	var body []byte
+	if transcribe {
+		cfg = transcribeCfg(echoBackend(t))
+		t0 := cfg.Tiers["transcribe-great"]
+		t0.LogBodies = tierSwitch
+		cfg.Tiers["transcribe-great"] = t0
+		body, ctype = buildMultipart(t, testBoundary, []formPart{
+			{name: "file", filename: "clip.wav", ctype: "audio/wav", data: fakeAudio(4096)},
+			{name: "model", data: []byte("transcribe-great")},
+			{name: "prompt", data: []byte("PRIORTRANSCRIPT")},
+		})
+		path = "/v1/audio/transcriptions"
+	} else {
+		back := newStub(t, func(w http.ResponseWriter, r *http.Request, body []byte) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"model":"g","choices":[{"message":{"content":"REPLYMARKER"}}]}`))
+		})
+		cfg = &Config{Tiers: map[string]Tier{
+			"great": {BaseURL: back.URL + "/v1", Model: "g", LogBodies: tierSwitch}}}
+		body = []byte(`{"model":"great","messages":[{"role":"user","content":"PROMPTMARKER"}]}`)
+		path, ctype = "/v1/chat/completions", "application/json"
+	}
+	cfg.Audit = &Audit{Dir: dir, LogBodies: global, LogResponses: responses}
+	srv := router(t, cfg)
+	if resp, raw := post(t, srv.URL+path, ctype, body, true); resp.StatusCode != 200 {
+		t.Fatalf("status %d: %s", resp.StatusCode, raw)
+	}
+	return auditRecords(t, dir, 1)[0]
+}
+
+func TestTierLogBodiesFalseTranscription(t *testing.T) {
+	rec := tierBodiesRun(t, true, boolp(false), boolp(true), true)
+	if _, ok := rec["request"]; ok {
+		t.Errorf("request recorded: %v", rec["request"])
+	}
+	if _, ok := rec["response"]; ok {
+		t.Errorf("response recorded: %v", rec["response"])
+	}
+	files, _ := rec["files"].([]any)
+	if len(files) != 1 || files[0].(map[string]any)["sha256"] != sum(fakeAudio(4096)) {
+		t.Errorf("files: %v", rec["files"])
+	}
+	if rec["tier"] != "transcribe-great" || rec["outcome"] != "ok" || rec["req_bytes"] == nil {
+		t.Errorf("record: %v", rec)
+	}
+}
+
+func TestTierLogBodiesFalseChat(t *testing.T) {
+	rec := tierBodiesRun(t, false, boolp(false), boolp(true), true)
+	if _, ok := rec["request"]; ok {
+		t.Errorf("request recorded: %v", rec["request"])
+	}
+	if _, ok := rec["request_truncated"]; ok {
+		t.Errorf("request_truncated recorded")
+	}
+	if _, ok := rec["response"]; ok {
+		t.Errorf("response recorded: %v", rec["response"])
+	}
+	if rec["tier"] != "great" || rec["outcome"] != "ok" {
+		t.Errorf("record: %v", rec)
+	}
+}
+
+func TestTierLogBodiesTrueOverridesGlobalOff(t *testing.T) {
+	rec := tierBodiesRun(t, false, boolp(true), boolp(false), true)
+	req, _ := rec["request"].(map[string]any)
+	if req["model"] != "great" {
+		t.Errorf("chat request not recorded: %v", rec["request"])
+	}
+	if r, _ := rec["response"].(string); !strings.Contains(r, "REPLYMARKER") {
+		t.Errorf("log_responses should still govern responses: %v", rec["response"])
+	}
+	rec = tierBodiesRun(t, false, boolp(true), boolp(false), false)
+	if _, ok := rec["response"]; ok {
+		t.Errorf("true must not force response capture: %v", rec["response"])
+	}
+	rec = tierBodiesRun(t, true, boolp(true), boolp(false), false)
+	req, _ = rec["request"].(map[string]any)
+	if req["prompt"] != "PRIORTRANSCRIPT" {
+		t.Errorf("transcription request not recorded: %v", rec["request"])
+	}
+	if files, _ := rec["files"].([]any); len(files) != 1 {
+		t.Errorf("files: %v", rec["files"])
+	}
+}
+
+func TestTierWithoutLogBodiesFollowsGlobal(t *testing.T) {
+	for _, transcribe := range []bool{false, true} {
+		on := tierBodiesRun(t, transcribe, nil, boolp(true), true)
+		if on["request"] == nil || on["response"] == nil {
+			t.Errorf("transcribe=%v global on: %v", transcribe, on)
+		}
+		off := tierBodiesRun(t, transcribe, nil, boolp(false), true)
+		if _, ok := off["request"]; ok {
+			t.Errorf("transcribe=%v global off recorded request: %v", transcribe, off["request"])
+		}
+		if off["response"] == nil {
+			t.Errorf("transcribe=%v log_responses should still record: %v", transcribe, off)
+		}
+	}
+}
+
+func TestTierLogBodiesEarlyRejectionFollowsGlobal(t *testing.T) {
+	for _, global := range []bool{true, false} {
+		dir := t.TempDir()
+		cfg := &Config{Audit: &Audit{Dir: dir, LogBodies: boolp(global)}, Tiers: map[string]Tier{
+			"great": {BaseURL: "http://127.0.0.1:1/v1", Model: "g", LogBodies: boolp(false)}}}
+		srv := router(t, cfg)
+		resp, _ := post(t, srv.URL+"/v1/chat/completions", "application/json",
+			[]byte(`{"model":"nope","x":"EARLY"}`), true)
+		if resp.StatusCode != 404 {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		rec := auditRecords(t, dir, 1)[0]
+		if rec["outcome"] != "unknown_tier" {
+			t.Errorf("record: %v", rec)
+		}
+		if _, has := rec["request"]; has != global {
+			t.Errorf("global=%v but request present=%v", global, has)
+		}
+	}
+}
+
+func TestTierLogBodiesVisibility(t *testing.T) {
+	cfg := &Config{Tiers: map[string]Tier{
+		"transcribe-great": {BaseURL: "http://127.0.0.1:1/v1", Model: "w", Kind: "transcription", LogBodies: boolp(false)},
+		"great":            {BaseURL: "http://127.0.0.1:1/v1", Model: "g"},
+		"fast":             {BaseURL: "http://127.0.0.1:1/v1", Model: "f", LogBodies: boolp(true)},
+	}}
+	cfg.Audit = &Audit{Dir: t.TempDir(), LogBodies: boolp(false)}
+	srv := router(t, cfg)
+	tiersOf := func(url string) map[string]map[string]any {
+		req, _ := http.NewRequest(http.MethodGet, url+"/_tiers", nil)
+		req.Header.Set("Authorization", "Bearer "+testKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var out struct {
+			Tiers map[string]map[string]any `json:"tiers"`
+		}
+		json.NewDecoder(resp.Body).Decode(&out)
+		return out.Tiers
+	}
+	tiers := tiersOf(srv.URL)
+	if tiers["transcribe-great"]["log_bodies"] != false ||
+		tiers["great"]["log_bodies"] != false ||
+		tiers["fast"]["log_bodies"] != true {
+		t.Errorf("/_tiers: %v", tiers)
+	}
+	d := describe(cfg)
+	if !strings.Contains(d, "[w] (transcription) (bodies not logged)") ||
+		strings.Contains(d, "[g] (") || strings.Contains(d, "[f] (") {
+		t.Errorf("describe: %s", d)
+	}
+
+	// With no audit configured nothing is logged, and /_tiers says so.
+	srv2 := router(t, &Config{Tiers: map[string]Tier{"great": {BaseURL: "http://127.0.0.1:1/v1", Model: "g"}}})
+	if got := tiersOf(srv2.URL)["great"]["log_bodies"]; got != false {
+		t.Errorf("no audit: %v", got)
 	}
 }

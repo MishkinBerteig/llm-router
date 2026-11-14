@@ -60,6 +60,11 @@ type Tier struct {
 	// Declared rather than guessed from the path so that a chat tier can never
 	// be handed an audio upload, nor an audio tier a prompt.
 	Kind string `json:"kind,omitempty"`
+	// Overrides audit.log_bodies for requests routed to this tier, and also
+	// keeps its responses out of the log when false. Omitted: follow the
+	// audit setting. A transcription prompt carries the previous piece's
+	// transcript, so a tier may need bodies paused while the rest stay on.
+	LogBodies *bool `json:"log_bodies,omitempty"`
 }
 
 const (
@@ -182,6 +187,15 @@ func (a *Audit) retain() int {
 
 func (a *Audit) bodies() bool {
 	return a.LogBodies == nil || *a.LogBodies
+}
+
+// tierBodies is whether request bodies are logged for a request routed to t:
+// the tier's own setting if it has one, else the audit-wide one.
+func tierBodies(t Tier, a *Audit) bool {
+	if t.LogBodies != nil {
+		return *t.LogBodies
+	}
+	return a != nil && a.bodies()
 }
 
 func (a *Audit) maxBody() int {
@@ -542,6 +556,9 @@ func describe(c *Config) string {
 		line := fmt.Sprintf("%s -> %s [%s]", n, t.BaseURL, t.Model)
 		if t.transcription() {
 			line += " (" + kindTranscription + ")"
+		}
+		if t.LogBodies != nil && !*t.LogBodies {
+			line += " (bodies not logged)"
 		}
 		parts = append(parts, line)
 	}
@@ -943,6 +960,27 @@ func truthy(v string) bool {
 	return false
 }
 
+// formAuditFields is the text fields of an upload as stored in an audit
+// record, each value cut to max bytes. Single values stay scalars.
+func formAuditFields(fields map[string][]string, max int) map[string]any {
+	req := map[string]any{}
+	for name, vals := range fields {
+		cut := make([]string, len(vals))
+		for i, v := range vals {
+			if len(v) > max {
+				v = v[:max]
+			}
+			cut[i] = v
+		}
+		if len(cut) == 1 {
+			req[name] = cut[0]
+		} else {
+			req[name] = cut
+		}
+	}
+	return req
+}
+
 // auditBody picks how a request body is stored. Raw JSON only when it really is
 // JSON: json.Marshal fails on an invalid RawMessage, and a record that cannot
 // be marshalled is silently dropped, which loses exactly the malformed requests
@@ -1039,7 +1077,8 @@ func newMux() *http.ServeMux {
 		defer finish(rec, start, http.StatusOK, "ok")
 		out := map[string]any{}
 		for n, t := range cfg.Tiers {
-			out[n] = map[string]string{"base_url": t.BaseURL, "model": t.Model, "kind": t.kind()}
+			out[n] = map[string]any{"base_url": t.BaseURL, "model": t.Model, "kind": t.kind(),
+				"log_bodies": tierBodies(t, cfg.Audit)}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"tiers": out})
@@ -1128,23 +1167,7 @@ func newMux() *http.ServeMux {
 				// a JSON prompt does.
 				rec["files"] = form.files
 				if cfg.Audit != nil && cfg.Audit.bodies() {
-					max := cfg.Audit.maxBody()
-					req := map[string]any{}
-					for name, vals := range form.fields {
-						cut := make([]string, len(vals))
-						for i, v := range vals {
-							if len(v) > max {
-								v = v[:max]
-							}
-							cut[i] = v
-						}
-						if len(cut) == 1 {
-							req[name] = cut[0]
-						} else {
-							req[name] = cut
-						}
-					}
-					rec["request"] = req
+					rec["request"] = formAuditFields(form.fields, cfg.Audit.maxBody())
 				}
 			}
 			if perr != nil {
@@ -1207,6 +1230,26 @@ func newMux() *http.ServeMux {
 			rec["tier"] = requested
 			rec["backend"] = tier.BaseURL
 			rec["backend_model"] = tier.Model
+			// The tier's log_bodies applies from here on; anything rejected
+			// earlier was recorded under the audit-wide setting. Only body
+			// content is touched: files, sizes and outcome always stay.
+			if cfg.Audit != nil {
+				switch {
+				case !tierBodies(tier, cfg.Audit):
+					delete(rec, "request")
+					delete(rec, "request_truncated")
+				case !cfg.Audit.bodies():
+					if isMultipart {
+						rec["request"] = formAuditFields(form.fields, cfg.Audit.maxBody())
+					} else {
+						v, truncated := auditBody(body, cfg.Audit.maxBody())
+						rec["request"] = v
+						if truncated {
+							rec["request_truncated"] = true
+						}
+					}
+				}
+			}
 		}
 		// Which endpoint a tier may be used on is part of its definition. A chat
 		// tier handed to the audio path used to reach the backend, which
@@ -1451,7 +1494,7 @@ func newMux() *http.ServeMux {
 		f, _ := w.(http.Flusher)
 		var dst io.Writer = flushWriter{w: w, f: f}
 		var capture *cappedBuffer
-		if rec != nil && cfg.Audit != nil && cfg.Audit.LogResponses {
+		if rec != nil && cfg.Audit != nil && cfg.Audit.LogResponses && (tier.LogBodies == nil || *tier.LogBodies) {
 			capture = &cappedBuffer{limit: cfg.Audit.maxBody()}
 			dst = io.MultiWriter(dst, capture)
 		}

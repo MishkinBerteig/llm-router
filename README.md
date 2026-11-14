@@ -78,6 +78,10 @@ stored, the change survives a restart.
   router's front door is the only thing protecting them.
 - **`kind`** is optional per tier: `"chat"` (the default) or `"transcription"`.
   Any other value is refused on load. See [Transcription](#transcription).
+- **`log_bodies`** is optional per tier and overrides `audit.log_bodies` for
+  requests routed to that tier. `false` keeps the tier's request and response
+  bodies out of the audit log; `true` logs its requests even when the audit
+  setting is off. See [Audit log](#audit-log).
 - **`listen`** must be `0.0.0.0` if a containerised client, such as Open WebUI in
   Docker, reaches the router via `host.docker.internal`. Bind every backend to
   loopback, so the router is the only LLM port exposed beyond the host.
@@ -302,6 +306,22 @@ because with bodies turned on the log holds everything everyone typed.
   the audio. See [Transcription](#transcription).
 - **`log_responses`** is off by default. Capturing a stream means buffering the
   whole completion, and the prompt is the part that shows intent.
+- **Per-tier `log_bodies`** overrides the audit-wide switch for one tier. A
+  transcription request's `prompt` field carries transcript text from the
+  previous piece, so you may want bodies paused there while chat tiers stay on:
+
+  ```json
+  "transcribe-great": { "base_url": "http://127.0.0.1:8202/v1", "model": "some-org/speech-model-large",
+                        "kind": "transcription", "log_bodies": false }
+  ```
+
+  `false` drops the tier's `request` and also its `response`, even with
+  `log_responses` on. `true` logs the request even when the audit-wide switch is
+  off, but does not turn response capture on. File metadata, sizes, the tier
+  and the outcome are always recorded. The switch applies once a request is
+  routed to a tier, so a request rejected earlier (`bad_json`, `no_model`,
+  `unknown_tier`, `too_large`, `denied`, ...) follows the audit-wide setting.
+  `GET /_tiers` shows each tier's effective `log_bodies`.
 
 Retention is a rolling window, pruned by the date in the filename, so a clock
 change cannot strand a file.
